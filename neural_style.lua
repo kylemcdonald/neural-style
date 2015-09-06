@@ -10,8 +10,12 @@ local loadcaffe_wrap = require 'loadcaffe_wrapper'
 local cmd = torch.CmdLine()
 
 -- Basic options
-cmd:option('-style_image', 'examples/inputs/seated-nude.jpg',
-           'Style target image')
+cmd:option('-style_image', 'input/square-seated.jpg',
+           'Style target image.')
+cmd:option('-style_image_lerp', 'input/square-starry.jpg',
+           'Style target image to use with lerp.')
+cmd:option('-style_lerp', 0.0, 'Interpolation amount from src to dst style.')
+cmd:option('-lerp_mode', 'post', 'pre|post')
 cmd:option('-content_image', 'examples/inputs/tubingen.jpg',
            'Content target image')
 cmd:option('-image_size', 512, 'Maximum height / width of generated image')
@@ -32,8 +36,8 @@ cmd:option('-output_image', 'out.png')
 -- Other options
 cmd:option('-style_scale', 1.0)
 cmd:option('-pooling', 'max', 'max|avg')
-cmd:option('-proto_file', 'models/VGG_ILSVRC_19_layers_deploy.prototxt')
-cmd:option('-model_file', 'models/VGG_ILSVRC_19_layers.caffemodel')
+cmd:option('-proto_file', '../models/VGG_ILSVRC_19_layers_deploy.prototxt')
+cmd:option('-model_file', '../models/VGG_ILSVRC_19_layers.caffemodel')
 cmd:option('-backend', 'nn', 'nn|cudnn')
 
 
@@ -63,10 +67,15 @@ local function main(params)
   local style_size = math.ceil(params.style_scale * params.image_size)
   style_image = image.scale(style_image, style_size, 'bilinear')
   local style_image_caffe = preprocess(style_image):float()
+
+  local style_image_lerp = grayscale_to_rgb(image.load(params.style_image_lerp))
+  style_image_lerp = image.scale(style_image_lerp, style_size, 'bilinear')
+  local style_image_lerp_caffe = preprocess(style_image_lerp):float()
   
   if params.gpu >= 0 then
     content_image_caffe = content_image_caffe:cuda()
     style_image_caffe = style_image_caffe:cuda()
+    style_image_lerp_caffe = style_image_lerp_caffe:cuda()
   end
   
   -- Hardcode these for now
@@ -117,9 +126,37 @@ local function main(params)
         if params.gpu >= 0 then
           gram = gram:cuda()
         end
-        local target_features = net:forward(style_image_caffe):clone()
-        local target = gram:forward(target_features)
-        target:div(target_features:nElement())
+
+        local features_src = net:forward(style_image_caffe):clone()
+        local features_dst = net:forward(style_image_lerp_caffe):clone()
+
+        local n_src = features_src:nElement()
+        local n_dst = features_dst:nElement()
+        if n_src ~= n_dst then
+          print(string.format('Two styles have different cardinality: %d, %d', n_src, n_dst))
+          os.exit()
+        end
+
+        local src_weight = (1. - params.style_lerp)
+        local dst_weight = (0. + params.style_lerp)
+
+        local target
+        if params.lerp_mode == 'post' then
+          local gram_src = gram:forward(features_src):clone()
+          local gram_dst = gram:forward(features_dst):clone()
+          gram_src:mul(src_weight / n_src)
+          gram_dst:mul(dst_weight / n_dst)
+          target = gram_src + gram_dst
+        else
+          features_src:mul(src_weight)
+          features_dst:mul(dst_weight)
+          local features = features_src + features_dst
+          target = gram:forward(features):clone()
+          target:div(n_src)
+        end
+
+        print(string.format('Operating on %d, %d with %f, %f', n_src, n_dst, src_weight, dst_weight))
+
         local weight = params.style_weight * style_layer_weights[next_style_idx]
         local loss_module = nn.StyleLoss(weight, target):float()
         if params.gpu >= 0 then
